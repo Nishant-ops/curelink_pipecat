@@ -1,12 +1,3 @@
-# Stage 1: Build Vite + React frontend
-FROM node:20-slim AS frontend-build
-WORKDIR /frontend
-COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm ci
-COPY frontend/ .
-RUN npm run build
-
-# Stage 2: Python backend + built frontend
 FROM python:3.11-slim
 WORKDIR /app
 
@@ -24,7 +15,10 @@ RUN pip install --no-cache-dir --default-timeout=300 \
  && pip install --no-cache-dir --default-timeout=300 -r requirements.txt
 
 COPY . .
-COPY --from=frontend-build /frontend/dist ./frontend/dist
+
+RUN python3 -m compileall -q /app \
+    && python3 -m compileall -q /usr/local/lib/python3.11/site-packages/ \
+    2>/dev/null; exit 0
 
 EXPOSE 8000
 

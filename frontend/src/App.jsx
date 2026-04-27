@@ -5,193 +5,158 @@ import {
   WebSocketTransport,
 } from '@pipecat-ai/websocket-transport'
 import './App.css'
-
-const ROUND_OPTIONS = [5, 10, 15, 20]
-
-const INITIAL_GAME_STATE = {
-  score: 0,
-  round: 0,
-  total_rounds: 10,
-  current_word: '',
-  last_result: '',
-  game_over: false,
-  session_active: false,
-}
+import {
+  AUDIO_SAMPLE_RATE,
+  BOT_AVATAR_INITIALS,
+  BOT_DISPLAY_NAME,
+  GAME_STATE_PATH,
+  LABEL_CORRECT,
+  LABEL_CORRECT_ICON,
+  LABEL_INCORRECT,
+  LABEL_INCORRECT_ICON,
+  POLL_INTERVAL_MS,
+  RESULT_CORRECT,
+  WS_PATH,
+} from './constants'
 
 export default function App() {
-  const [rounds, setRounds] = useState(10)
-  const [status, setStatus] = useState('Disconnected')
-  const [logs, setLogs] = useState([])
-  const [gameState, setGameState] = useState(INITIAL_GAME_STATE)
-  const [isConnecting, setIsConnecting] = useState(false)
-  const [isConnected, setIsConnected] = useState(false)
+  const [joined, setJoined] = useState(false)
+  const [joining, setJoining] = useState(false)
+  const [botSpeaking, setBotSpeaking] = useState(false)
+  const [userSpeaking, setUserSpeaking] = useState(false)
+  const [gameState, setGameState] = useState(null)
+  const [history, setHistory] = useState([])
 
   const clientRef = useRef(null)
   const audioRef = useRef(null)
-  const pollRef = useRef(null)
+  const prevStateRef = useRef(null)
 
   const wsUrl = useMemo(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    return `${protocol}//${window.location.host}/ws?total_rounds=${rounds}`
-  }, [rounds])
+    return `${protocol}//${window.location.host}${WS_PATH}`
+  }, [])
 
-  const pushLog = (message) => {
-    setLogs((prev) => [
-      ...prev,
-      {
-        id: `${Date.now()}-${prev.length}`,
-        message,
-        timestamp: new Date().toISOString(),
-      },
-    ])
-  }
+  // Poll game state while joined
+  useEffect(() => {
+    if (!joined) return
+    const id = setInterval(async () => {
+      try {
+        const res = await fetch(GAME_STATE_PATH)
+        if (!res.ok) return
+        const data = await res.json()
+        setGameState(data)
 
-  const updateStatus = (nextStatus) => {
-    setStatus(nextStatus)
-    pushLog(`Status: ${nextStatus}`)
-  }
+        const prev = prevStateRef.current
+        // When a round completes (last_result flips to correct/incorrect)
+        if (
+          data.last_result &&
+          data.current_word &&
+          prev &&
+          (prev.last_result !== data.last_result || prev.current_word !== data.current_word || prev.round !== data.round)
+        ) {
+          setHistory((h) => {
+            // avoid duplicate entries for same word+result
+            const last = h[h.length - 1]
+            if (last && last.word === data.current_word && last.result === data.last_result) return h
+            return [...h, { word: data.current_word, result: data.last_result }]
+          })
+        }
+        prevStateRef.current = data
+      } catch {}
+    }, POLL_INTERVAL_MS)
+    return () => clearInterval(id)
+  }, [joined])
 
   const attachAudioTrack = (track) => {
     const audioEl = audioRef.current
     if (!audioEl) return
-
-    pushLog(
-      `Incoming audio track: id=${track.id} readyState=${track.readyState} muted=${track.muted}`
-    )
-
     const currentStream = audioEl.srcObject
-    if (currentStream?.getAudioTracks?.()[0]?.id === track.id) {
-      return
-    }
-
-    track.onmute = () => pushLog(`Audio track muted: ${track.id}`)
-    track.onunmute = () => pushLog(`Audio track unmuted: ${track.id}`)
-    track.onended = () => pushLog(`Audio track ended: ${track.id}`)
-
+    if (currentStream?.getAudioTracks?.()[0]?.id === track.id) return
     audioEl.srcObject = new MediaStream([track])
-    audioEl
-      .play()
-      .then(() => pushLog('Audio playback started'))
-      .catch((error) => pushLog(`Audio playback blocked: ${error.message}`))
-    pushLog('Attached bot audio track')
+    audioEl.play().catch(() => {})
   }
 
   const setupMediaTracks = () => {
     const client = clientRef.current
     if (!client) return
-
     const tracks = client.tracks()
-    if (tracks.bot?.audio) {
-      attachAudioTrack(tracks.bot.audio)
-    }
-  }
-
-  const startPollingGameState = () => {
-    clearInterval(pollRef.current)
-    pollRef.current = setInterval(async () => {
-      try {
-        const response = await fetch('/game-state')
-        const nextState = await response.json()
-        setGameState(nextState)
-      } catch {
-        // ignore transient polling failures
-      }
-    }, 700)
-  }
-
-  const stopPollingGameState = () => {
-    clearInterval(pollRef.current)
-    pollRef.current = null
+    if (tracks.bot?.audio) attachAudioTrack(tracks.bot.audio)
   }
 
   const cleanupAudio = () => {
     const audioEl = audioRef.current
     if (!audioEl?.srcObject?.getAudioTracks) return
-
-    audioEl.srcObject.getAudioTracks().forEach((track) => track.stop())
+    audioEl.srcObject.getAudioTracks().forEach((t) => t.stop())
     audioEl.srcObject = null
   }
 
-  const disconnect = async () => {
-    stopPollingGameState()
-
+  const leave = async () => {
     const client = clientRef.current
     if (!client) {
       cleanupAudio()
-      setIsConnected(false)
-      setIsConnecting(false)
+      setJoined(false)
+      setJoining(false)
       return
     }
-
     try {
       await client.disconnect()
-    } catch (error) {
-      pushLog(`Error disconnecting: ${error.message}`)
-    } finally {
+    } catch {}
+    finally {
       clientRef.current = null
       cleanupAudio()
-      setIsConnected(false)
-      setIsConnecting(false)
+      setJoined(false)
+      setJoining(false)
+      setBotSpeaking(false)
+      setUserSpeaking(false)
     }
   }
 
-  const connect = async () => {
-    if (isConnecting || isConnected) return
-
-    setLogs([])
-    setGameState({ ...INITIAL_GAME_STATE, total_rounds: rounds })
-    setIsConnecting(true)
-    updateStatus('Connecting')
+  const join = async () => {
+    if (joining) return
+    if (joined) await leave()
+    setJoining(true)
+    setHistory([])
+    setGameState(null)
+    prevStateRef.current = null
 
     const client = new PipecatClient({
       transport: new WebSocketTransport({
         serializer: new ProtobufFrameSerializer(),
-        recorderSampleRate: 16000,
-        playerSampleRate: 16000,
+        recorderSampleRate: AUDIO_SAMPLE_RATE,
+        playerSampleRate: AUDIO_SAMPLE_RATE,
       }),
       enableMic: true,
       enableCam: false,
       callbacks: {
         onConnected: () => {
-          setIsConnected(true)
-          setIsConnecting(false)
-          updateStatus('Connected')
-          startPollingGameState()
+          setJoined(true)
+          setJoining(false)
         },
         onDisconnected: () => {
-          updateStatus('Disconnected')
-          setIsConnected(false)
-          setIsConnecting(false)
-          stopPollingGameState()
-          pushLog('Client disconnected')
+          setJoined(false)
+          setJoining(false)
+          setBotSpeaking(false)
+          setUserSpeaking(false)
         },
-        onBotReady: (data) => {
-          pushLog(`Bot ready: ${JSON.stringify(data)}`)
+        onBotReady: () => {
           setupMediaTracks()
         },
+        onBotStartedSpeaking: () => {
+          setBotSpeaking(true)
+          // After a user interruption, WavStreamPlayer marks the "default" track as
+          // interrupted and silently drops all subsequent audio until cleared.
+          // Reset it here so each new bot utterance gets a fresh AudioWorklet stream.
+          const player = clientRef.current?._transport?._mediaManager?._wavStreamPlayer
+          if (player) player.interruptedTrackIds = {}
+        },
+        onBotStoppedSpeaking: () => setBotSpeaking(false),
         onUserStartedSpeaking: () => {
+          setUserSpeaking(true)
           const transport = clientRef.current?._transport
           transport?._mediaManager?.userStartedSpeaking?.()
         },
-        onUserTranscript: (data) => {
-          if (data.final) {
-            pushLog(`User: ${data.text}`)
-          }
-        },
-        onBotTranscript: (data) => {
-          pushLog(`Bot: ${data.text}`)
-        },
-        onTransportStateChange: (nextState) => {
-          pushLog(`Transport: ${nextState}`)
-        },
-        onMessageError: (error) => {
-          pushLog(`Message error: ${error.message}`)
-          console.error('Message error:', error)
-        },
-        onError: (error) => {
-          pushLog(`Error: ${error.message}`)
-          console.error('Error:', error)
-        },
+        onUserStoppedSpeaking: () => setUserSpeaking(false),
+        onError: (error) => console.error('Error:', error),
       },
     })
 
@@ -203,155 +168,118 @@ export default function App() {
       }
     })
 
-    client.on(RTVIEvent.TrackStopped, (track, participant) => {
-      pushLog(
-        `Track stopped: ${track.kind} from ${participant?.name || 'unknown'}`
-      )
-    })
-
     try {
-      pushLog('Initializing devices...')
       await client.initDevices()
-
-      pushLog(`Connecting to ${wsUrl}`)
       await client.connect({ wsUrl })
-
       window.pcClient = client
     } catch (error) {
-      pushLog(`Error connecting: ${error.message}`)
-      updateStatus('Error')
-      await disconnect()
+      console.error('Connection error:', error)
+      await leave()
     }
   }
 
   useEffect(() => {
     const audioEl = audioRef.current
-    if (audioEl) {
-      audioEl.playsInline = true
-      audioEl.onplay = () => pushLog('Audio element play event')
-      audioEl.onpause = () => pushLog('Audio element pause event')
-      audioEl.onerror = () => pushLog('Audio element error')
-      audioEl.onloadedmetadata = () => pushLog('Audio metadata loaded')
-    }
-
-    return () => {
-      disconnect()
-    }
+    if (audioEl) audioEl.playsInline = true
+    return () => { leave() }
   }, [])
 
+  const isActive = joined || gameState?.game_over
+
   return (
-    <div className="app-shell">
+    <div className="shell">
       <audio ref={audioRef} autoPlay />
 
-      <section className="panel hero-panel">
-        <p className="eyebrow">Spell Bee Bot</p>
-        <h1>Pipecat WebSocket Client</h1>
-        <p className="lede">
-          This UI connects the browser to your FastAPI Pipecat websocket at
-          <code> /ws</code> using the official Pipecat JS client transport.
-        </p>
+      <h1 className="title">Spell Bee</h1>
 
-        <div className="controls">
-          <label className="field" htmlFor="rounds">
-            <span>Rounds</span>
-            <select
-              id="rounds"
-              value={rounds}
-              onChange={(event) => setRounds(Number(event.target.value))}
-              disabled={isConnected || isConnecting}
-            >
-              {ROUND_OPTIONS.map((option) => (
-                <option key={option} value={option}>
-                  {option}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <div className="button-row">
-            <button
-              className="btn btn-primary"
-              type="button"
-              onClick={connect}
-              disabled={isConnecting || isConnected}
-            >
-              {isConnecting ? 'Connecting...' : 'Connect'}
-            </button>
-            <button
-              className="btn btn-secondary"
-              type="button"
-              onClick={disconnect}
-              disabled={!isConnecting && !isConnected}
-            >
-              Disconnect
-            </button>
+      {/* Score + round panel */}
+      {isActive && gameState && (
+        <div className="scoreboard">
+          <div className="score-block">
+            <span className="score-label">Score</span>
+            <span className="score-value">{gameState.score} <span className="score-total">/ {gameState.total_rounds}</span></span>
           </div>
-        </div>
-
-        <div className="status-row">
-          <span className="status-label">Status</span>
-          <strong>{status}</strong>
-        </div>
-      </section>
-
-      <section className="panel game-panel">
-        <div className="panel-header">
-          <h2>Live Game State</h2>
-          <span className={gameState.session_active ? 'pill live' : 'pill'}>
-            {gameState.session_active ? 'Session Active' : 'Idle'}
-          </span>
-        </div>
-
-        <div className="stats-grid">
-          <article className="stat-card">
-            <span>Round</span>
-            <strong>
-              {gameState.round || 0} / {gameState.total_rounds}
-            </strong>
-          </article>
-          <article className="stat-card">
-            <span>Score</span>
-            <strong>{gameState.score}</strong>
-          </article>
-          <article className="stat-card">
-            <span>Current word</span>
-            <strong>{gameState.current_word || 'Waiting...'}</strong>
-          </article>
-          <article className="stat-card">
-            <span>Last result</span>
-            <strong>{gameState.last_result || 'None yet'}</strong>
-          </article>
-        </div>
-      </section>
-
-      <section className="panel log-panel">
-        <div className="panel-header">
-          <h2>Debug Log</h2>
-          <span className="pill">{logs.length} entries</span>
-        </div>
-
-        <div className="log-list" id="debug-log">
-          {logs.length === 0 ? (
-            <p className="empty-state">No events yet.</p>
-          ) : (
-            logs.map((entry) => (
-              <div
-                key={entry.id}
-                className={`log-entry ${
-                  entry.message.startsWith('User: ')
-                    ? 'user'
-                    : entry.message.startsWith('Bot: ')
-                      ? 'bot'
-                      : ''
-                }`}
-              >
-                <time>{entry.timestamp}</time>
-                <span>{entry.message}</span>
+          <div className="divider" />
+          <div className="score-block">
+            <span className="score-label">Round</span>
+            <span className="score-value">{gameState.round || '—'} <span className="score-total">/ {gameState.total_rounds}</span></span>
+          </div>
+          {gameState.last_result && (
+            <>
+              <div className="divider" />
+              <div className={`result-badge ${gameState.last_result}`}>
+                {gameState.last_result === RESULT_CORRECT ? LABEL_CORRECT : LABEL_INCORRECT}
               </div>
-            ))
+            </>
+          )}
+          {gameState.game_over && (
+            <div className="game-over-badge">Game Over</div>
           )}
         </div>
-      </section>
+      )}
+
+      {!joined && !joining && !gameState?.game_over && (
+        <button className="join-btn" onClick={join}>
+          Join Game
+        </button>
+      )}
+
+      {joining && (
+        <p className="joining-text">Joining...</p>
+      )}
+
+      {gameState?.game_over && !joining && (
+        <button className="join-btn" onClick={join}>
+          Play Again
+        </button>
+      )}
+
+      {joined && (
+        <div className="participants">
+          <div className={`participant ${botSpeaking ? 'speaking' : ''}`}>
+            <div className="avatar">
+              <span>{BOT_AVATAR_INITIALS}</span>
+              <div className="mic-ring" />
+            </div>
+            <p className="participant-name">{BOT_DISPLAY_NAME}</p>
+            <div className="mic-bars">
+              {[...Array(4)].map((_, i) => (
+                <div key={i} className="bar" style={{ '--i': i }} />
+              ))}
+            </div>
+          </div>
+
+          <div className={`participant ${userSpeaking ? 'speaking' : ''}`}>
+            <div className="avatar">
+              <span>You</span>
+              <div className="mic-ring" />
+            </div>
+            <p className="participant-name">You</p>
+            <div className="mic-bars">
+              {[...Array(4)].map((_, i) => (
+                <div key={i} className="bar" style={{ '--i': i }} />
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Word history */}
+      {history.length > 0 && (
+        <div className="history">
+          <h2 className="history-title">History</h2>
+          <ul className="history-list">
+            {[...history].reverse().map((entry, i) => (
+              <li key={i} className={`history-item ${entry.result}`}>
+                <span className="history-word">{entry.word}</span>
+                <span className="history-badge">
+                  {entry.result === RESULT_CORRECT ? LABEL_CORRECT_ICON : LABEL_INCORRECT_ICON}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   )
 }

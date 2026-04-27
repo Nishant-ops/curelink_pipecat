@@ -1,6 +1,4 @@
-pipecat-ai[deepgram,silero,openai,local-smart-turn]>=0.0.45
+pipecat-ai[deepgram,silero,openai,rnnoise]>=0.0.45
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 python-dotenv>=1.0.0
-httpx>=0.27.0
-aiofiles>=23.2.1

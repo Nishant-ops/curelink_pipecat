@@ -1,42 +1,37 @@
 import logging
-from pathlib import Path
+import os
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
+
+from spell_bee_bot import run_spell_bee_bot
+from constants import APP_TITLE
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+_REQUIRED_ENV_VARS = ["OPENAI_API_KEY", "DEEPGRAM_API_KEY"]
+for _var in _REQUIRED_ENV_VARS:
+    if not os.getenv(_var):
+        raise RuntimeError(f"Missing required environment variable: {_var}")
+
 _game_state: dict = {
     "score": 0,
     "round": 0,
-    "total_rounds": 10,
+    "total_rounds": 5,
     "current_word": "",
     "last_result": "",
     "game_over": False,
     "session_active": False,
 }
 
-
-def _update_game_state(state: dict):
-    _game_state.update(state)
+app = FastAPI(title=APP_TITLE)
 
 
-app = FastAPI(title="Spell Bee Bot")
-
-
-@app.on_event("startup")
-async def _prewarm_models():
-    try:
-        from bot import _get_smart_turn, _get_vad
-        import asyncio
-        await asyncio.to_thread(_get_vad)
-        await asyncio.to_thread(_get_smart_turn)
-        logger.info("Prewarmed VAD + smart-turn models")
-    except Exception:
-        logger.exception("Model prewarm failed; will lazy-load on first /ws")
+@app.get("/health")
+async def health():
+    return JSONResponse({"status": "ok"})
 
 
 @app.get("/game-state")
@@ -45,8 +40,9 @@ async def game_state():
 
 
 @app.websocket("/ws")
-async def ws_endpoint(websocket: WebSocket, total_rounds: int = 10):
+async def ws_endpoint(websocket: WebSocket, total_rounds: int = 5):
     await websocket.accept()
+
     _game_state.update({
         "score": 0,
         "round": 0,
@@ -57,23 +53,16 @@ async def ws_endpoint(websocket: WebSocket, total_rounds: int = 10):
         "session_active": True,
     })
 
-    from bot import run_bot
+    def _update(state: dict):
+        _game_state.update(state)
+
     try:
-        await run_bot(
+        await run_spell_bee_bot(
             websocket=websocket,
-            on_state_update=_update_game_state,
+            on_state_update=_update,
             total_rounds=total_rounds,
         )
     except WebSocketDisconnect:
         pass
     finally:
         _game_state["session_active"] = False
-
-
-DIST = Path(__file__).parent / "frontend" / "dist"
-if DIST.exists():
-    app.mount("/assets", StaticFiles(directory=DIST / "assets"), name="assets")
-
-    @app.get("/")
-    async def index():
-        return FileResponse(DIST / "index.html")
