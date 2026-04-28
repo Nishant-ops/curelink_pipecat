@@ -101,17 +101,12 @@ class SpellBeeGameProcessor(FrameProcessor):
             return
 
         if isinstance(frame, TextFrame):
-            if self._is_collecting_llm:
-                logger.info("TextFrame [collecting-llm] phase=%s text=%r", self._phase.name, frame.text)
-                self._llm_buffer += frame.text
-            else:
-                logger.info("TextFrame [non-collecting] phase=%s text=%r", self._phase.name, frame.text)
-                if self._phase == GamePhase.WAITING:
-                    if self._interrupted:
-                        self._interrupted = False
-                        await self._announce_current_word(prefix=SPEECH_INTERRUPTION_PREFIX)
-                    else:
-                        await self._evaluate(frame.text)
+            logger.info(
+                "TextFrame [collecting-llm] phase=%s text=%r",
+                self._phase.name,
+                frame.text,
+            )
+            self._llm_buffer += frame.text
             return
 
         if isinstance(frame, LLMFullResponseEndFrame):
